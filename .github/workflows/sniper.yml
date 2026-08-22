@@ -1,0 +1,57 @@
+name: OCI Mumbai Sniper
+
+on:
+  schedule:
+    # Runs every 5 minutes
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install OCI CLI
+        run: |
+          bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)" -- --accept-all-defaults
+          echo "/home/runner/bin" >> $GITHUB_PATH
+
+      - name: Setup Credentials
+        run: |
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat <<EOF > ~/.oci/config
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=ocid1.tenancy.oc1..aaaaaaaabgs3v7qmcfgwigwivozppenzcftnfri4p4t6l6ezivnufvgk2fla
+          region=ap-mumbai-1
+          key_file=/home/runner/.oci/oci_api_key.pem
+          EOF
+
+      - name: Poll Capacity Loop
+        run: |
+          # Internal loop polling every 20s for ~4.5 minutes per run
+          for i in {1..13}; do
+            echo "Attempt $i..."
+            RESPONSE=$(oci compute instance launch \
+              --compartment-id "ocid1.tenancy.oc1..aaaaaaaabgs3v7qmcfgwigwivozppenzcftnfri4p4t6l6ezivnufvgk2fla" \
+              --availability-domain "Jtuw:AP-MUMBAI-1-AD-1" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus": 2, "memoryInGBs": 12}' \
+              --subnet-id "ocid1.subnet.oc1.ap-mumbai-1.aaaaaaaahuhlbpgw677erv3df5to6ekkpv3lrtwtkaxehingef7iujjsd6sa" \
+              --source-details '{"sourceType": "bootVolume", "bootVolumeId": "ocid1.bootvolume.oc1.ap-mumbai-1.abrg6ljr4qwrr2xccovinwntvm457hbkzyddmx5bdzgunfq5yhrctu7fmpuq"}' \
+              --display-name "saitoVM" \
+              --assign-public-ip true 2>&1)
+            
+            if echo "$RESPONSE" | grep -qi '"id": "ocid1.instance.'; then
+              echo ">>> SUCCESS! Instance provisioned. <<<"
+              exit 0
+            elif echo "$RESPONSE" | grep -qi "Out of host capacity"; then
+              echo "Out of capacity. Retrying in 20s..."
+              sleep 20
+            else
+              echo "API Response: $RESPONSE"
+              sleep 20
+            fi
+          done

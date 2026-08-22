@@ -2,7 +2,7 @@ name: OCI Mumbai Sniper
 
 on:
   schedule:
-    # Runs every 5 minutes
+    # Triggers every 5 minutes in GitHub's cloud
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
@@ -22,8 +22,8 @@ jobs:
           chmod 600 ~/.oci/oci_api_key.pem
           cat <<EOF > ~/.oci/config
           [DEFAULT]
-          user=${{ secrets.OCI_USER_OCID }}
-          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          user=ocid1.user.oc1..aaaaaaaawe5b6ahghq7dz7uxnahko4zrynr2zm5fkb3l7ka6xl56gu5t32fa
+          fingerprint=de:eb:ba:16:50:d4:dd:67:8a:44:ac:64:69:64:ad:9c
           tenancy=ocid1.tenancy.oc1..aaaaaaaabgs3v7qmcfgwigwivozppenzcftnfri4p4t6l6ezivnufvgk2fla
           region=ap-mumbai-1
           key_file=/home/runner/.oci/oci_api_key.pem
@@ -31,10 +31,13 @@ jobs:
 
       - name: Poll Capacity Loop
         run: |
-          # Internal loop polling every 20s for ~4.5 minutes per run
+          # Prevent runner from aborting on API errors
+          set +e
+          
           for i in {1..13}; do
-            echo "Attempt $i..."
-            RESPONSE=$(oci compute instance launch \
+            echo "--- Attempt $i ($(date '+%H:%M:%S')) ---"
+            
+            RESPONSE=$(/home/runner/bin/oci compute instance launch \
               --compartment-id "ocid1.tenancy.oc1..aaaaaaaabgs3v7qmcfgwigwivozppenzcftnfri4p4t6l6ezivnufvgk2fla" \
               --availability-domain "Jtuw:AP-MUMBAI-1-AD-1" \
               --shape "VM.Standard.A1.Flex" \
@@ -45,13 +48,14 @@ jobs:
               --assign-public-ip true 2>&1)
             
             if echo "$RESPONSE" | grep -qi '"id": "ocid1.instance.'; then
-              echo ">>> SUCCESS! Instance provisioned. <<<"
+              echo ">>> SUCCESS! Instance provisioned successfully! <<<"
               exit 0
             elif echo "$RESPONSE" | grep -qi "Out of host capacity"; then
-              echo "Out of capacity. Retrying in 20s..."
-              sleep 20
+              echo "Status: Out of capacity in Mumbai. Retrying in 20s..."
             else
-              echo "API Response: $RESPONSE"
-              sleep 20
+              echo "API Output:"
+              echo "$RESPONSE"
             fi
+            
+            sleep 20
           done

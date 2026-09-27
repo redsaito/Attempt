@@ -1,11 +1,14 @@
-name: OCI Mumbai Sniper
+name: OCI Mumbai Sniper v2
 
 on:
   schedule:
-    # Triggers every 5 minutes in GitHub's cloud
+    # Start a new long-running sniper every 5 minutes.
+    # Concurrency below ensures only one actually runs at a time.
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
+# IMPORTANT:
+# Never run multiple copies of the sniper simultaneously.
 concurrency:
   group: oci-mumbai-sniper
   cancel-in-progress: false
@@ -13,18 +16,56 @@ concurrency:
 jobs:
   launch:
     runs-on: ubuntu-latest
-    steps:
-      - name: Install OCI CLI
-        run: |
-          bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)" -- --accept-all-defaults
-          echo "/home/runner/bin" >> $GITHUB_PATH
 
-      - name: Setup Credentials
+    # Stay below GitHub's hosted-job maximum while still polling for hours.
+    timeout-minutes: 350
+
+    env:
+      OCI_BIN: /home/runner/bin/oci
+
+      COMPARTMENT_ID: "ocid1.tenancy.oc1..aaaaaaaabgs3v7qmcfgwigwivozppenzcftnfri4p4t6l6ezivnufvgk2fla"
+      AVAILABILITY_DOMAIN: "Jtuw:AP-MUMBAI-1-AD-1"
+
+      SHAPE: "VM.Standard.A1.Flex"
+      OCPUS: "2"
+      MEMORY_GB: "12"
+
+      SUBNET_ID: "ocid1.subnet.oc1.ap-mumbai-1.aaaaaaaahuhlbpgw677erv3df5to6ekkpv3lrtwtkaxehingef7iujjsd6sa"
+
+      BOOT_VOLUME_ID: "ocid1.bootvolume.oc1.ap-mumbai-1.abrg6ljr4qwrr2xccovinwntvm457hbkzyddmx5bdzgunfq5yhrctu7fmpuq"
+
+      INSTANCE_NAME: "saitoVM"
+
+    steps:
+
+      # ------------------------------------------------------------
+      # 1. Install OCI CLI
+      # ------------------------------------------------------------
+      - name: Install OCI CLI
+        shell: bash
         run: |
-          mkdir -p ~/.oci
-          echo "${{ secrets.OCI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
-          chmod 600 ~/.oci/oci_api_key.pem
-          cat <<EOF > ~/.oci/config
+          set -e
+
+          bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)" \
+            -- --accept-all-defaults
+
+          echo "/home/runner/bin" >> "$GITHUB_PATH"
+
+      # ------------------------------------------------------------
+      # 2. Configure OCI credentials
+      # ------------------------------------------------------------
+      - name: Setup Credentials
+        shell: bash
+        run: |
+          set -e
+          umask 077
+
+          mkdir -p "$HOME/.oci"
+
+          printf '%s' '${{ secrets.OCI_KEY_CONTENT }}' > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+
+          cat > "$HOME/.oci/config" <<EOF
           [DEFAULT]
           user=ocid1.user.oc1..aaaaaaaawe5b6ahghq7dz7uxnahko4zrynr2zm5fkb3l7ka6xl56gu5t32fa
           fingerprint=de:eb:ba:16:50:d4:dd:67:8a:44:ac:64:69:64:ad:9c
@@ -32,36 +73,270 @@ jobs:
           region=ap-mumbai-1
           key_file=/home/runner/.oci/oci_api_key.pem
           EOF
-          chmod 600 ~/.oci/config
 
-      - name: Poll Capacity Loop
+          chmod 600 "$HOME/.oci/config"
+
+          echo "OCI credentials configured."
+
+      # ------------------------------------------------------------
+      # 3. Check whether we already successfully have the VM
+      # ------------------------------------------------------------
+      - name: Check Existing Instance
+        shell: bash
         run: |
-          # Prevent runner from aborting on API errors
           set +e
-          
-          for i in {1..13}; do
-            echo "--- Attempt $i ($(date '+%H:%M:%S')) ---"
-            
-            RESPONSE=$(/home/runner/bin/oci compute instance launch \
+
+          echo "Checking whether $INSTANCE_NAME already exists..."
+
+          EXISTING_RESPONSE=$(
+            timeout 60s "$OCI_BIN" compute instance list \
               --no-retry \
-              --compartment-id "ocid1.tenancy.oc1..aaaaaaaabgs3v7qmcfgwigwivozppenzcftnfri4p4t6l6ezivnufvgk2fla" \
-              --availability-domain "Jtuw:AP-MUMBAI-1-AD-1" \
-              --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus": 2, "memoryInGBs": 12}' \
-              --subnet-id "ocid1.subnet.oc1.ap-mumbai-1.aaaaaaaahuhlbpgw677erv3df5to6ekkpv3lrtwtkaxehingef7iujjsd6sa" \
-              --source-details '{"sourceType": "bootVolume", "bootVolumeId": "ocid1.bootvolume.oc1.ap-mumbai-1.abrg6ljr4qwrr2xccovinwntvm457hbkzyddmx5bdzgunfq5yhrctu7fmpuq"}' \
-              --display-name "saitoVM" \
-              --assign-public-ip true 2>&1)
-            
-            if echo "$RESPONSE" | grep -qi '"id": "ocid1.instance.'; then
-              echo ">>> SUCCESS! Instance provisioned successfully! <<<"
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$AVAILABILITY_DOMAIN" \
+              --display-name "$INSTANCE_NAME" \
+              --all \
+              --output json \
+              2>&1
+          )
+
+          RC=$?
+
+          if [ "$RC" -eq 0 ]; then
+
+            EXISTING_ID=$(
+              printf '%s' "$EXISTING_RESPONSE" |
+              jq -r '
+                .data[]
+                | select(."lifecycle-state" != "TERMINATED")
+                | .id
+              ' |
+              head -n 1
+            )
+
+            if [[ "$EXISTING_ID" == ocid1.instance.* ]]; then
+              echo ""
+              echo "=================================================="
+              echo "INSTANCE ALREADY EXISTS"
+              echo "Instance: $EXISTING_ID"
+              echo "=================================================="
+              echo ""
+              echo "Nothing else needs to be launched."
               exit 0
-            elif echo "$RESPONSE" | grep -qi "Out of host capacity"; then
-              echo "Status: Out of capacity in Mumbai. Retrying in 90s..."
-            else
-              echo "API Output:"
-              echo "$RESPONSE"
             fi
-            
-            sleep 90
+
+            echo "No existing non-terminated $INSTANCE_NAME instance found."
+
+          else
+
+            echo "Could not complete existing-instance check."
+            echo "$EXISTING_RESPONSE"
+            echo ""
+            echo "Continuing to launch logic."
+            echo "The launch request itself will be authoritative."
+
+          fi
+
+      # ------------------------------------------------------------
+      # 4. Keep trying for almost the full GitHub job lifetime
+      # ------------------------------------------------------------
+      - name: Sniper
+        shell: bash
+        run: |
+          set +e
+
+          # We deliberately stay below the GitHub job timeout.
+          # 345 minutes = 5h45m.
+          MAX_RUNTIME_SECONDS=$((345 * 60))
+
+          START_TIME=$(date +%s)
+
+          # Normal capacity polling interval.
+          NORMAL_WAIT=90
+
+          # Initial 429 backoff.
+          RATE_LIMIT_WAIT=180
+
+          ATTEMPT=0
+
+          echo ""
+          echo "=================================================="
+          echo "OCI MUMBAI A1 SNIPER STARTED"
+          echo "=================================================="
+          echo "Shape:       $SHAPE"
+          echo "OCPUs:       $OCPUS"
+          echo "Memory:      ${MEMORY_GB} GB"
+          echo "AD:          $AVAILABILITY_DOMAIN"
+          echo "Runtime:     ~5h45m"
+          echo "Normal wait: ${NORMAL_WAIT}s"
+          echo "=================================================="
+          echo ""
+
+          while true; do
+
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - START_TIME))
+
+            if [ "$ELAPSED" -ge "$MAX_RUNTIME_SECONDS" ]; then
+              echo ""
+              echo "=================================================="
+              echo "SNIPER TIME WINDOW FINISHED"
+              echo "No instance was provisioned during this run."
+              echo "=================================================="
+              exit 0
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
+
+            CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
+            echo ""
+            echo "--------------------------------------------------"
+            echo "Attempt #$ATTEMPT"
+            echo "Time: $CURRENT_TIME"
+            echo "Elapsed: $((ELAPSED / 60)) minutes"
+            echo "--------------------------------------------------"
+
+            RESPONSE=$(
+              timeout 90s "$OCI_BIN" compute instance launch \
+                --no-retry \
+                --connection-timeout 15 \
+                --read-timeout 60 \
+                --compartment-id "$COMPARTMENT_ID" \
+                --availability-domain "$AVAILABILITY_DOMAIN" \
+                --shape "$SHAPE" \
+                --shape-config "{\"ocpus\": $OCPUS, \"memoryInGBs\": $MEMORY_GB}" \
+                --subnet-id "$SUBNET_ID" \
+                --source-details "{\"sourceType\": \"bootVolume\", \"bootVolumeId\": \"$BOOT_VOLUME_ID\"}" \
+                --display-name "$INSTANCE_NAME" \
+                --assign-public-ip true \
+                --query 'data.id' \
+                --raw-output \
+                2>&1
+            )
+
+            RC=$?
+
+            # ------------------------------------------------------
+            # SUCCESS
+            # ------------------------------------------------------
+            if [ "$RC" -eq 0 ] && [[ "$RESPONSE" == ocid1.instance.* ]]; then
+
+              INSTANCE_ID="$RESPONSE"
+
+              echo ""
+              echo "=================================================="
+              echo "             SUCCESS — INSTANCE CREATED"
+              echo "=================================================="
+              echo "Instance ID:"
+              echo "$INSTANCE_ID"
+              echo "=================================================="
+              echo ""
+              echo "Stopping sniper immediately."
+              echo ""
+
+              exit 0
+            fi
+
+            # ------------------------------------------------------
+            # TIMEOUT / NETWORK FAILURE
+            # ------------------------------------------------------
+            if [ "$RC" -eq 124 ]; then
+              echo "OCI request timed out."
+              echo "Waiting 180 seconds before retrying..."
+              sleep 180
+              continue
+            fi
+
+            # ------------------------------------------------------
+            # 429 RATE LIMIT
+            # ------------------------------------------------------
+            if echo "$RESPONSE" | grep -Eqi \
+              'TooManyRequests|too many requests|status.?[:=] 429|HTTP.?429'; then
+
+              echo ""
+              echo ">>> OCI RATE LIMIT DETECTED (429) <<<"
+              echo "$RESPONSE"
+              echo ""
+              echo "Backing off for ${RATE_LIMIT_WAIT} seconds..."
+
+              sleep "$RATE_LIMIT_WAIT"
+
+              # Exponential backoff:
+              # 180 -> 360 -> 720 -> 900 -> 900...
+              RATE_LIMIT_WAIT=$((RATE_LIMIT_WAIT * 2))
+
+              if [ "$RATE_LIMIT_WAIT" -gt 900 ]; then
+                RATE_LIMIT_WAIT=900
+              fi
+
+              continue
+            fi
+
+            # ------------------------------------------------------
+            # REAL OCI CAPACITY FAILURE
+            # ------------------------------------------------------
+            if echo "$RESPONSE" | grep -Eqi \
+              'Out of host capacity|out of capacity|capacity.*unavailable|insufficient.*capacity'; then
+
+              echo ""
+              echo ">>> OCI A1 CAPACITY UNAVAILABLE <<<"
+              echo "Oracle does not currently have suitable host capacity."
+              echo "Waiting ${NORMAL_WAIT} seconds..."
+              echo ""
+
+              # If capacity responses are working normally again,
+              # reset any previous 429 backoff.
+              RATE_LIMIT_WAIT=180
+
+              sleep "$NORMAL_WAIT"
+              continue
+            fi
+
+            # ------------------------------------------------------
+            # TRANSIENT OCI / NETWORK SERVER ERROR
+            # ------------------------------------------------------
+            if echo "$RESPONSE" | grep -Eqi \
+              'InternalServerError|Internal Server Error|ServiceUnavailable|Service Unavailable|GatewayTimeout|Gateway Timeout|RequestTimeout|ConnectionError|connection.*reset|502|503|504'; then
+
+              echo ""
+              echo ">>> TRANSIENT OCI/SERVER ERROR <<<"
+              echo "$RESPONSE"
+              echo ""
+              echo "Waiting 180 seconds before retrying..."
+
+              sleep 180
+              continue
+            fi
+
+            # ------------------------------------------------------
+            # KNOWN FATAL CONFIGURATION / PERMISSION ERRORS
+            # ------------------------------------------------------
+            if echo "$RESPONSE" | grep -Eqi \
+              'NotAuthorized|NotAuthorizedOrNotFound|InvalidParameter|LimitExceeded|QuotaExceeded|IncorrectState|NotAuthorizedOrNotFound'; then
+
+              echo ""
+              echo "=================================================="
+              echo "FATAL OCI ERROR"
+              echo "=================================================="
+              echo "$RESPONSE"
+              echo ""
+              echo "This is not a normal capacity failure."
+              echo "The sniper is stopping so you can fix the configuration."
+              echo "=================================================="
+
+              exit 1
+            fi
+
+            # ------------------------------------------------------
+            # UNKNOWN ERROR
+            # ------------------------------------------------------
+            echo ""
+            echo ">>> UNRECOGNIZED OCI RESPONSE <<<"
+            echo "$RESPONSE"
+            echo ""
+            echo "Treating it as transient and waiting 180 seconds..."
+            echo ""
+
+            sleep 180
+
           done

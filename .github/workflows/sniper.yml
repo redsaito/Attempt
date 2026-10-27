@@ -1,42 +1,67 @@
-name: OCI Mumbai Sniper v2
+name: OCI Mumbai Sniper v3
 
 on:
   schedule:
-    # Start a new long-running sniper every 5 minutes.
-    # Concurrency below ensures only one actually runs at a time.
+    # A new run is queued every 5 minutes. The concurrency group below keeps one
+    # run active plus one waiting, so there is almost no gap between 5h45m runs.
+    # Lots of "cancelled" runs in the Actions tab are expected (replaced waiters).
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
-# IMPORTANT:
-# Never run multiple copies of the sniper simultaneously.
 concurrency:
   group: oci-mumbai-sniper
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  actions: write # only used to disable this workflow once the VM exists
+
 jobs:
   launch:
     runs-on: ubuntu-latest
-
-    # Stay below GitHub's hosted-job maximum while still polling for hours.
     timeout-minutes: 350
 
     env:
       OCI_BIN: /home/runner/bin/oci
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      GH_TOKEN: ${{ github.token }}
 
-      COMPARTMENT_ID: "ocid1.tenancy.oc1..aaaaaaaabgs3v7qmcfgwigwivozppenzcftnfri4p4t6l6ezivnufvgk2fla"
+      # ---- identifiers and keys: stored as repository secrets ----
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_KEY_CONTENT: ${{ secrets.OCI_KEY_CONTENT }}
+      SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+      BOOT_VOLUME_ID: ${{ secrets.OCI_BOOT_VOLUME_ID }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }} # optional, phone alerts via ntfy.sh
+
+      # ---- settings you may want to tweak ----
+      OCI_REGION: "ap-mumbai-1"
       AVAILABILITY_DOMAIN: "Jtuw:AP-MUMBAI-1-AD-1"
-
       SHAPE: "VM.Standard.A1.Flex"
-      OCPUS: "2"
-      MEMORY_GB: "12"
-
-      SUBNET_ID: "ocid1.subnet.oc1.ap-mumbai-1.aaaaaaaahuhlbpgw677erv3df5to6ekkpv3lrtwtkaxehingef7iujjsd6sa"
-
-      BOOT_VOLUME_ID: "ocid1.bootvolume.oc1.ap-mumbai-1.abrg6ljr4qwrr2xccovinwntvm457hbkzyddmx5bdzgunfq5yhrctu7fmpuq"
-
+      # Small requests find capacity far more often. Resize up in the console later.
+      OCPUS: "1"
+      MEMORY_GB: "6"
       INSTANCE_NAME: "saitoVM"
+      NORMAL_WAIT: "60" # seconds between capacity attempts (+0-19s random jitter)
 
     steps:
+
+      # ------------------------------------------------------------
+      # 0. Fail fast if a secret is missing or misnamed
+      # ------------------------------------------------------------
+      - name: Preflight
+        shell: bash
+        run: |
+          missing=0
+          for v in OCI_TENANCY_OCID OCI_USER_OCID OCI_FINGERPRINT OCI_KEY_CONTENT SUBNET_ID BOOT_VOLUME_ID; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Missing repository secret for $v"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "All required secrets are present."
 
       # ------------------------------------------------------------
       # 1. Install OCI CLI
@@ -62,26 +87,26 @@ jobs:
 
           mkdir -p "$HOME/.oci"
 
-          printf '%s' '${{ secrets.OCI_KEY_CONTENT }}' > "$HOME/.oci/oci_api_key.pem"
+          printf '%s\n' "$OCI_KEY_CONTENT" > "$HOME/.oci/oci_api_key.pem"
           chmod 600 "$HOME/.oci/oci_api_key.pem"
 
-          cat > "$HOME/.oci/config" <<EOF
-          [DEFAULT]
-          user=ocid1.user.oc1..aaaaaaaawe5b6ahghq7dz7uxnahko4zrynr2zm5fkb3l7ka6xl56gu5t32fa
-          fingerprint=de:eb:ba:16:50:d4:dd:67:8a:44:ac:64:69:64:ad:9c
-          tenancy=ocid1.tenancy.oc1..aaaaaaaabgs3v7qmcfgwigwivozppenzcftnfri4p4t6l6ezivnufvgk2fla
-          region=ap-mumbai-1
-          key_file=/home/runner/.oci/oci_api_key.pem
-          EOF
+          {
+            echo "[DEFAULT]"
+            echo "user=$OCI_USER_OCID"
+            echo "fingerprint=$OCI_FINGERPRINT"
+            echo "tenancy=$OCI_TENANCY_OCID"
+            echo "region=$OCI_REGION"
+            echo "key_file=$HOME/.oci/oci_api_key.pem"
+          } > "$HOME/.oci/config"
 
           chmod 600 "$HOME/.oci/config"
-
           echo "OCI credentials configured."
 
       # ------------------------------------------------------------
-      # 3. Check whether we already successfully have the VM
+      # 3. Do we already have the VM? If so, skip the sniper entirely
       # ------------------------------------------------------------
       - name: Check Existing Instance
+        id: check
         shell: bash
         run: |
           set +e
@@ -91,7 +116,7 @@ jobs:
           EXISTING_RESPONSE=$(
             timeout 60s "$OCI_BIN" compute instance list \
               --no-retry \
-              --compartment-id "$COMPARTMENT_ID" \
+              --compartment-id "$OCI_TENANCY_OCID" \
               --availability-domain "$AVAILABILITY_DOMAIN" \
               --display-name "$INSTANCE_NAME" \
               --all \
@@ -106,8 +131,8 @@ jobs:
             EXISTING_ID=$(
               printf '%s' "$EXISTING_RESPONSE" |
               jq -r '
-                .data[]
-                | select(."lifecycle-state" != "TERMINATED")
+                .data[]?
+                | select(."lifecycle-state" | IN("TERMINATED", "TERMINATING") | not)
                 | .id
               ' |
               head -n 1
@@ -116,11 +141,15 @@ jobs:
             if [[ "$EXISTING_ID" == ocid1.instance.* ]]; then
               echo ""
               echo "=================================================="
-              echo "INSTANCE ALREADY EXISTS"
-              echo "Instance: $EXISTING_ID"
+              echo "INSTANCE ALREADY EXISTS: $EXISTING_ID"
+              echo "Skipping the sniper and disabling this workflow."
               echo "=================================================="
-              echo ""
-              echo "Nothing else needs to be launched."
+
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+
+              gh workflow disable "$GITHUB_WORKFLOW" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
+                || echo "Could not auto-disable the workflow. Disable it manually in the Actions tab."
+
               exit 0
             fi
 
@@ -128,35 +157,46 @@ jobs:
 
           else
 
-            echo "Could not complete existing-instance check."
+            echo "Could not complete existing-instance check:"
             echo "$EXISTING_RESPONSE"
-            echo ""
-            echo "Continuing to launch logic."
-            echo "The launch request itself will be authoritative."
+            echo "Continuing to launch logic; the launch request itself is authoritative."
 
           fi
+
+          echo "exists=false" >> "$GITHUB_OUTPUT"
 
       # ------------------------------------------------------------
       # 4. Keep trying for almost the full GitHub job lifetime
       # ------------------------------------------------------------
       - name: Sniper
+        if: steps.check.outputs.exists != 'true'
         shell: bash
         run: |
           set +e
 
-          # We deliberately stay below the GitHub job timeout.
-          # 345 minutes = 5h45m.
-          MAX_RUNTIME_SECONDS=$((345 * 60))
-
+          # 335 minutes leaves room for install steps and one last slow attempt
+          # before the 350-minute job timeout.
+          MAX_RUNTIME_SECONDS=$((335 * 60))
           START_TIME=$(date +%s)
-
-          # Normal capacity polling interval.
-          NORMAL_WAIT=90
-
-          # Initial 429 backoff.
           RATE_LIMIT_WAIT=180
-
           ATTEMPT=0
+
+          notify() {
+            [ -z "$NTFY_TOPIC" ] && return 0
+            curl -fsS -m 15 \
+              -H "Title: $1" \
+              -H "Priority: urgent" \
+              -d "$2" \
+              "https://ntfy.sh/$NTFY_TOPIC" > /dev/null 2>&1 || true
+          }
+
+          disable_self() {
+            if gh workflow disable "$GITHUB_WORKFLOW" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              echo "This workflow has been disabled."
+            else
+              echo "Could not auto-disable the workflow. Disable it manually in the Actions tab."
+            fi
+          }
 
           echo ""
           echo "=================================================="
@@ -166,8 +206,8 @@ jobs:
           echo "OCPUs:       $OCPUS"
           echo "Memory:      ${MEMORY_GB} GB"
           echo "AD:          $AVAILABILITY_DOMAIN"
-          echo "Runtime:     ~5h45m"
-          echo "Normal wait: ${NORMAL_WAIT}s"
+          echo "Runtime:     ~5h35m"
+          echo "Normal wait: ${NORMAL_WAIT}s (+ jitter)"
           echo "=================================================="
           echo ""
 
@@ -179,20 +219,19 @@ jobs:
             if [ "$ELAPSED" -ge "$MAX_RUNTIME_SECONDS" ]; then
               echo ""
               echo "=================================================="
-              echo "SNIPER TIME WINDOW FINISHED"
+              echo "SNIPER TIME WINDOW FINISHED after $ATTEMPT attempts."
               echo "No instance was provisioned during this run."
+              echo "The next scheduled run will continue."
               echo "=================================================="
               exit 0
             fi
 
             ATTEMPT=$((ATTEMPT + 1))
 
-            CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S %Z')
-
             echo ""
             echo "--------------------------------------------------"
             echo "Attempt #$ATTEMPT"
-            echo "Time: $CURRENT_TIME"
+            echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
             echo "Elapsed: $((ELAPSED / 60)) minutes"
             echo "--------------------------------------------------"
 
@@ -201,7 +240,7 @@ jobs:
                 --no-retry \
                 --connection-timeout 15 \
                 --read-timeout 60 \
-                --compartment-id "$COMPARTMENT_ID" \
+                --compartment-id "$OCI_TENANCY_OCID" \
                 --availability-domain "$AVAILABILITY_DOMAIN" \
                 --shape "$SHAPE" \
                 --shape-config "{\"ocpus\": $OCPUS, \"memoryInGBs\": $MEMORY_GB}" \
@@ -221,28 +260,24 @@ jobs:
             # ------------------------------------------------------
             if [ "$RC" -eq 0 ] && [[ "$RESPONSE" == ocid1.instance.* ]]; then
 
-              INSTANCE_ID="$RESPONSE"
-
               echo ""
               echo "=================================================="
-              echo "             SUCCESS — INSTANCE CREATED"
+              echo "          SUCCESS: INSTANCE CREATED"
               echo "=================================================="
-              echo "Instance ID:"
-              echo "$INSTANCE_ID"
+              echo "Instance ID: $RESPONSE"
               echo "=================================================="
-              echo ""
-              echo "Stopping sniper immediately."
               echo ""
 
+              notify "OCI A1 SUCCESS" "Instance $INSTANCE_NAME created after $ATTEMPT attempts in this run."
+              disable_self
               exit 0
             fi
 
             # ------------------------------------------------------
-            # TIMEOUT / NETWORK FAILURE
+            # TIMEOUT / NETWORK HANG
             # ------------------------------------------------------
             if [ "$RC" -eq 124 ]; then
-              echo "OCI request timed out."
-              echo "Waiting 180 seconds before retrying..."
+              echo "OCI request timed out. Waiting 180 seconds before retrying..."
               sleep 180
               continue
             fi
@@ -251,20 +286,17 @@ jobs:
             # 429 RATE LIMIT
             # ------------------------------------------------------
             if echo "$RESPONSE" | grep -Eqi \
-              'TooManyRequests|too many requests|status.?[:=] 429|HTTP.?429'; then
+              'TooManyRequests|too many requests|status.?[:=] ?429|HTTP.?429'; then
 
               echo ""
               echo ">>> OCI RATE LIMIT DETECTED (429) <<<"
               echo "$RESPONSE"
-              echo ""
               echo "Backing off for ${RATE_LIMIT_WAIT} seconds..."
 
               sleep "$RATE_LIMIT_WAIT"
 
-              # Exponential backoff:
               # 180 -> 360 -> 720 -> 900 -> 900...
               RATE_LIMIT_WAIT=$((RATE_LIMIT_WAIT * 2))
-
               if [ "$RATE_LIMIT_WAIT" -gt 900 ]; then
                 RATE_LIMIT_WAIT=900
               fi
@@ -273,35 +305,32 @@ jobs:
             fi
 
             # ------------------------------------------------------
-            # REAL OCI CAPACITY FAILURE
+            # REAL OCI CAPACITY FAILURE (the normal case)
             # ------------------------------------------------------
             if echo "$RESPONSE" | grep -Eqi \
               'Out of host capacity|out of capacity|capacity.*unavailable|insufficient.*capacity'; then
 
-              echo ""
               echo ">>> OCI A1 CAPACITY UNAVAILABLE <<<"
-              echo "Oracle does not currently have suitable host capacity."
-              echo "Waiting ${NORMAL_WAIT} seconds..."
-              echo ""
 
-              # If capacity responses are working normally again,
-              # reset any previous 429 backoff.
               RATE_LIMIT_WAIT=180
 
-              sleep "$NORMAL_WAIT"
+              WAIT=$((NORMAL_WAIT + RANDOM % 20))
+              echo "Waiting ${WAIT} seconds..."
+              sleep "$WAIT"
               continue
             fi
 
             # ------------------------------------------------------
-            # TRANSIENT OCI / NETWORK SERVER ERROR
+            # TRANSIENT OCI / NETWORK ERROR
+            # (status codes are anchored so digits inside request IDs
+            #  or OCIDs cannot trigger a false match)
             # ------------------------------------------------------
             if echo "$RESPONSE" | grep -Eqi \
-              'InternalServerError|Internal Server Error|ServiceUnavailable|Service Unavailable|GatewayTimeout|Gateway Timeout|RequestTimeout|ConnectionError|connection.*reset|502|503|504'; then
+              'InternalServerError|InternalError|Internal Server Error|ServiceUnavailable|Service Unavailable|GatewayTimeout|Gateway Timeout|RequestTimeout|ConnectionError|connection.*reset|"status": ?50[234]'; then
 
               echo ""
               echo ">>> TRANSIENT OCI/SERVER ERROR <<<"
               echo "$RESPONSE"
-              echo ""
               echo "Waiting 180 seconds before retrying..."
 
               sleep 180
@@ -309,10 +338,12 @@ jobs:
             fi
 
             # ------------------------------------------------------
-            # KNOWN FATAL CONFIGURATION / PERMISSION ERRORS
+            # FATAL CONFIGURATION / PERMISSION ERRORS
+            # Stop, alert once, and disable the workflow so you do not get
+            # a failure email every 5 minutes. Fix the cause, then re-enable.
             # ------------------------------------------------------
             if echo "$RESPONSE" | grep -Eqi \
-              'NotAuthorized|NotAuthorizedOrNotFound|InvalidParameter|LimitExceeded|QuotaExceeded|IncorrectState|NotAuthorizedOrNotFound'; then
+              'NotAuthenticated|NotAuthorized|NotAuthorizedOrNotFound|InvalidParameter|LimitExceeded|QuotaExceeded|IncorrectState'; then
 
               echo ""
               echo "=================================================="
@@ -321,21 +352,21 @@ jobs:
               echo "$RESPONSE"
               echo ""
               echo "This is not a normal capacity failure."
-              echo "The sniper is stopping so you can fix the configuration."
+              echo "Fix the configuration, then re-enable the workflow."
               echo "=================================================="
 
+              notify "OCI sniper STOPPED (fatal error)" "Check the Actions log. Workflow disabled until you fix it."
+              disable_self
               exit 1
             fi
 
             # ------------------------------------------------------
-            # UNKNOWN ERROR
+            # UNKNOWN ERROR: show it, treat as transient
             # ------------------------------------------------------
             echo ""
             echo ">>> UNRECOGNIZED OCI RESPONSE <<<"
             echo "$RESPONSE"
-            echo ""
             echo "Treating it as transient and waiting 180 seconds..."
-            echo ""
 
             sleep 180
 

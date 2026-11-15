@@ -43,7 +43,7 @@ jobs:
       OCPUS: "1"
       MEMORY_GB: "6"
       INSTANCE_NAME: "saitoVM"
-      NORMAL_WAIT: "60" # seconds between capacity attempts (+0-19s random jitter)
+      NORMAL_WAIT: "100" # seconds between capacity attempts (+0-19s random jitter)
 
     steps:
 

@@ -1,4 +1,4 @@
-name: OCI Mumbai Sniper v3
+name: OCI Mumbai Sniper v3.1
 
 on:
   schedule:
@@ -43,7 +43,7 @@ jobs:
       OCPUS: "1"
       MEMORY_GB: "6"
       INSTANCE_NAME: "saitoVM"
-      NORMAL_WAIT: "100" # seconds between capacity attempts (+0-19s random jitter)
+      NORMAL_WAIT: "100" # seconds between attempts (+0-19s jitter). ~60-80s gets 429s.
 
     steps:
 
@@ -62,6 +62,21 @@ jobs:
           done
           [ "$missing" -eq 0 ] || exit 1
           echo "All required secrets are present."
+
+      # ------------------------------------------------------------
+      # Manual runs only: prove the phone alert works
+      # ------------------------------------------------------------
+      - name: Test notification (manual runs only)
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          if [ -z "$NTFY_TOPIC" ]; then
+            echo "NTFY_TOPIC is not set; skipping."
+            exit 0
+          fi
+          curl -fsS -m 15 -H "Title: OCI sniper test" \
+            -d "Test ping from GitHub Actions. If you see this, success alerts will work." \
+            "https://ntfy.sh/$NTFY_TOPIC" > /dev/null && echo "Test notification sent."
 
       # ------------------------------------------------------------
       # 1. Install OCI CLI
@@ -180,6 +195,13 @@ jobs:
           START_TIME=$(date +%s)
           RATE_LIMIT_WAIT=180
           ATTEMPT=0
+          N_CAP=0
+          N_429=0
+
+          # Pull just the "message" field out of an OCI ServiceError JSON blob.
+          oci_msg() {
+            printf '%s' "$1" | grep -oE '"message": ?"[^"]*"' | head -1
+          }
 
           notify() {
             [ -z "$NTFY_TOPIC" ] && return 0
@@ -220,6 +242,7 @@ jobs:
               echo ""
               echo "=================================================="
               echo "SNIPER TIME WINDOW FINISHED after $ATTEMPT attempts."
+              echo "Capacity responses: $N_CAP | 429 rate limits: $N_429"
               echo "No instance was provisioned during this run."
               echo "The next scheduled run will continue."
               echo "=================================================="
@@ -258,13 +281,17 @@ jobs:
             # ------------------------------------------------------
             # SUCCESS
             # ------------------------------------------------------
-            if [ "$RC" -eq 0 ] && [[ "$RESPONSE" == ocid1.instance.* ]]; then
+            # Look for the instance OCID anywhere in the output so a stray
+            # warning line on stderr cannot hide a real success.
+            INSTANCE_ID=$(printf '%s' "$RESPONSE" | grep -oE 'ocid1\.instance\.[A-Za-z0-9._-]+' | head -1)
+
+            if [ "$RC" -eq 0 ] && [ -n "$INSTANCE_ID" ]; then
 
               echo ""
               echo "=================================================="
               echo "          SUCCESS: INSTANCE CREATED"
               echo "=================================================="
-              echo "Instance ID: $RESPONSE"
+              echo "Instance ID: $INSTANCE_ID"
               echo "=================================================="
               echo ""
 
@@ -288,9 +315,8 @@ jobs:
             if echo "$RESPONSE" | grep -Eqi \
               'TooManyRequests|too many requests|status.?[:=] ?429|HTTP.?429'; then
 
-              echo ""
-              echo ">>> OCI RATE LIMIT DETECTED (429) <<<"
-              echo "$RESPONSE"
+              N_429=$((N_429 + 1))
+              echo ">>> OCI RATE LIMIT (429) <<< $(oci_msg "$RESPONSE")"
               echo "Backing off for ${RATE_LIMIT_WAIT} seconds..."
 
               sleep "$RATE_LIMIT_WAIT"
@@ -310,7 +336,9 @@ jobs:
             if echo "$RESPONSE" | grep -Eqi \
               'Out of host capacity|out of capacity|capacity.*unavailable|insufficient.*capacity'; then
 
+              N_CAP=$((N_CAP + 1))
               echo ">>> OCI A1 CAPACITY UNAVAILABLE <<<"
+              echo "Oracle said: $(oci_msg "$RESPONSE")"
 
               RATE_LIMIT_WAIT=180
 
